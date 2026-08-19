@@ -176,6 +176,12 @@
   .switch input:checked + .switch-track{ background:#1FA35C; }
   .switch input:checked + .switch-track::before{ transform:translateX(1.1rem); }
   .switch-row{ display:flex; align-items:center; gap:.6rem; }
+
+  /* Actualizaciones "silenciosas" por sincronización en segundo plano: se evita repetir la
+     animación de entrada de las tarjetas (fade-in) para que un cambio remoto no se sienta como
+     un parpadeo/destello en toda la pantalla. La navegación normal del usuario sí conserva la
+     animación (se ve fluida); solo se apaga durante un refresco disparado por otra persona. */
+  body.silent-sync .fade-in{ animation:none !important; }
 </style>
 </head>
 <body class="min-h-screen">
@@ -766,8 +772,11 @@ function persistUser(user){
   .catch(e=>{ console.error('Error guardando asesor en la nube:', e); cloudSyncStatus='error'; updateSyncBadge(); toast('No se pudo sincronizar este asesor con la nube.', 'warn'); });
 }
 function deleteUserRemote(userId){
-  if(!FIREBASE_ENABLED || !usersCollRef) return;
-  usersCollRef.doc(userId).delete().catch(e=>console.error('Error eliminando asesor en la nube:', e));
+  if(!FIREBASE_ENABLED || !usersCollRef) return Promise.resolve();
+  return usersCollRef.doc(userId).delete().catch(e=>{
+    console.error('Error eliminando asesor en la nube:', e);
+    toast('⚠️ No se pudo eliminar este asesor de la nube (revisa las Reglas de Firestore). Puede reaparecer.', 'warn');
+  });
 }
 function persistCohortHistoryEntry(entry){
   saveState(DB);
@@ -795,6 +804,17 @@ function persistLiveQuizHistoryEntry(entry){
    -------------------------------------------------------------------------- */
 let _remoteRenderTimer = null;
 let _remoteRenderPending = false;
+/** Aplica un cambio que llegó de otra persona sin el "destello" visual: mantiene la posición
+ *  de scroll donde estaba y evita que las tarjetas repitan su animación de aparición — eso es
+ *  lo que hacía que un simple refresco en segundo plano se sintiera como que la pantalla entera
+ *  parpadea, incluso ya agrupando varios cambios en una sola actualización. */
+function renderSilently(){
+  const scrollY = window.scrollY;
+  document.body.classList.add('silent-sync');
+  render();
+  window.scrollTo(0, scrollY);
+  requestAnimationFrame(()=>{ document.body.classList.remove('silent-sync'); });
+}
 function scheduleRemoteRender(){
   cloudSyncStatus = 'synced';
   clearTimeout(_remoteRenderTimer);
@@ -807,8 +827,8 @@ function scheduleRemoteRender(){
       return;
     }
     _remoteRenderPending = false;
-    render();
-  }, 600);
+    renderSilently();
+  }, 900);
 }
 document.addEventListener('focusout', (e)=>{
   if(!_remoteRenderPending) return;
@@ -823,7 +843,7 @@ document.addEventListener('focusout', (e)=>{
     const stillTyping = active && $app && $app.contains(active) && ['INPUT','TEXTAREA','SELECT'].includes(active.tagName);
     if(stillTyping) return;
     _remoteRenderPending = false;
-    render();
+    renderSilently();
   }, 150);
 });
 
@@ -832,58 +852,80 @@ function subscribeToRemoteChanges(){
   unsubConfig = configDocRef.onSnapshot(snap=>{
     if(!snap.exists || snap.metadata.hasPendingWrites) return;
     const cfg = snap.data();
+    // Firestore avisa DOS veces cada guardado: primero de inmediato (hasPendingWrites=true,
+    // ya filtrado arriba) y otra vez cuando el servidor lo confirma (hasPendingWrites=false) —
+    // esa segunda notificación llega también para los cambios que ACABAMOS de hacer nosotros
+    // mismos, y sin este chequeo generaba un refresco de pantalla "fantasma" extra en cada
+    // acción de cualquier persona (eso era buena parte del pestañeo). Si el contenido es
+    // idéntico al que ya tenemos localmente, no hay nada nuevo que mostrar.
+    const changed = JSON.stringify(cfg) !== JSON.stringify(configSnapshotFromDB());
     Object.assign(DB, cfg);
     ensureStateShape(DB);
     saveState(DB);
-    scheduleRemoteRender();
+    if(changed) scheduleRemoteRender(); else { cloudSyncStatus='synced'; updateSyncBadge(); }
   }, err=>{ console.error('Error de sincronización (config):', err); cloudSyncStatus='error'; updateSyncBadge(); });
 
   if(unsubUsers) unsubUsers();
   unsubUsers = usersCollRef.onSnapshot(snap=>{
+    let changed = false;
     snap.docChanges().forEach(change=>{
       if(change.doc.metadata.hasPendingWrites) return; // ignora el eco de nuestro propio guardado
       const u = change.doc.data();
       if(change.type==='removed'){
+        if(DB.users.some(x=>x.id===u.id)) changed = true;
         DB.users = DB.users.filter(x=>x.id!==u.id);
       } else {
         const idx = DB.users.findIndex(x=>x.id===u.id);
-        if(idx>=0) DB.users[idx] = u; else DB.users.push(u);
+        if(idx>=0){
+          if(JSON.stringify(DB.users[idx]) !== JSON.stringify(u)) changed = true;
+          DB.users[idx] = u;
+        } else { changed = true; DB.users.push(u); }
       }
     });
     saveState(DB);
-    scheduleRemoteRender();
+    if(changed) scheduleRemoteRender();
   }, err=>{ console.error('Error de sincronización (asesores):', err); cloudSyncStatus='error'; updateSyncBadge(); });
 
   if(unsubCohortHistory) unsubCohortHistory();
   unsubCohortHistory = cohortHistoryCollRef.onSnapshot(snap=>{
+    let changed = false;
     snap.docChanges().forEach(change=>{
       if(change.doc.metadata.hasPendingWrites) return;
       const h = change.doc.data();
       if(change.type==='removed'){
+        if(DB.cohortHistory.some(x=>x.id===h.id)) changed = true;
         DB.cohortHistory = DB.cohortHistory.filter(x=>x.id!==h.id);
       } else {
         const idx = DB.cohortHistory.findIndex(x=>x.id===h.id);
-        if(idx>=0) DB.cohortHistory[idx] = h; else DB.cohortHistory.push(h);
+        if(idx>=0){
+          if(JSON.stringify(DB.cohortHistory[idx]) !== JSON.stringify(h)) changed = true;
+          DB.cohortHistory[idx] = h;
+        } else { changed = true; DB.cohortHistory.push(h); }
       }
     });
     saveState(DB);
-    scheduleRemoteRender();
+    if(changed) scheduleRemoteRender();
   }, err=>{ console.error('Error de sincronización (historial):', err); });
 
   if(unsubLiveQuizHistory) unsubLiveQuizHistory();
   unsubLiveQuizHistory = liveQuizHistoryCollRef.onSnapshot(snap=>{
+    let changed = false;
     snap.docChanges().forEach(change=>{
       if(change.doc.metadata.hasPendingWrites) return;
       const h = change.doc.data();
       if(change.type==='removed'){
+        if(DB.liveQuizHistory.some(x=>x.id===h.id)) changed = true;
         DB.liveQuizHistory = DB.liveQuizHistory.filter(x=>x.id!==h.id);
       } else {
         const idx = DB.liveQuizHistory.findIndex(x=>x.id===h.id);
-        if(idx>=0) DB.liveQuizHistory[idx] = h; else DB.liveQuizHistory.push(h);
+        if(idx>=0){
+          if(JSON.stringify(DB.liveQuizHistory[idx]) !== JSON.stringify(h)) changed = true;
+          DB.liveQuizHistory[idx] = h;
+        } else { changed = true; DB.liveQuizHistory.push(h); }
       }
     });
     saveState(DB);
-    scheduleRemoteRender();
+    if(changed) scheduleRemoteRender();
   }, err=>{ console.error('Error de sincronización (historial de competencias):', err); });
 }
 
@@ -1559,6 +1601,7 @@ function dashboardHTML(scopeCountry, isMasterView, scopeTrainerId){
   let trainerRows = [];
   const countriesForBreakdown = isMasterView ? (scopeCountry? [scopeCountry] : COUNTRIES.map(c=>c.code)) : [scopeCountry];
   countriesForBreakdown.forEach(code=>{
+    const validTrainerIds = new Set(trainersOfCountry(code).map(t=>t.id));
     trainersOfCountry(code).forEach(t=>{
       const tUsers = DB.users.filter(u=>u.country===code && u.trainerId===t.id);
       if(tUsers.length===0 && isMasterView===false) return; // en vista entrenador, solo su propia fila tiene sentido
@@ -1566,8 +1609,21 @@ function dashboardHTML(scopeCountry, isMasterView, scopeTrainerId){
       tUsers.forEach(u=>{ const st = userOverallProgress(u, sortedModulesForUser(u)); pctSum+=st.pct; if(st.completedCount>0){scoreSum+=st.avgScore; scoreN++;} });
       trainerRows.push({ country:code, trainer:t, count:tUsers.length, avgPct: tUsers.length? Math.round(pctSum/tUsers.length):0, avgScore: scoreN? Math.round(scoreSum/scoreN):0 });
     });
+    // Asesores "huérfanos": su trainerId no coincide con NINGÚN entrenador que exista hoy en este
+    // país (típico si se borró/recreó un perfil de entrenador). Sin esto, estos asesores seguían
+    // apareciendo en «Detalle por asesor» pero desaparecían en silencio de esta tabla y del
+    // gráfico comparativo — dando la sensación de que las dos vistas "no están sincronizadas".
+    if(isMasterView || countriesForBreakdown[0]===code){
+      const orphanUsers = DB.users.filter(u=>u.country===code && !validTrainerIds.has(u.trainerId));
+      if(orphanUsers.length){
+        let pctSum=0, scoreSum=0, scoreN=0;
+        orphanUsers.forEach(u=>{ const st = userOverallProgress(u, sortedModulesForUser(u)); pctSum+=st.pct; if(st.completedCount>0){scoreSum+=st.avgScore; scoreN++;} });
+        trainerRows.push({ country:code, trainer:{ id:null, name:'⚠️ Sin entrenador/a válido', active:true }, count:orphanUsers.length,
+          avgPct: Math.round(pctSum/orphanUsers.length), avgScore: scoreN? Math.round(scoreSum/scoreN):0, orphan:true });
+      }
+    }
   });
-  if(!isMasterView) trainerRows = trainerRows.filter(r=>r.trainer.id===scopeTrainerId);
+  if(!isMasterView) trainerRows = trainerRows.filter(r=>r.trainer.id===scopeTrainerId || r.orphan);
 
   // Asesores en riesgo: score bajo con al menos un módulo completado, o sin ningún avance (posible abandono)
   const lowPerformers = users
@@ -3222,25 +3278,44 @@ async function factoryReset(){
   if(val !== 'REINICIAR'){ toast('Escribe REINICIAR para confirmar', 'warn'); return; }
   try{ if(window.indexedDB && indexedDB.deleteDatabase) indexedDB.deleteDatabase(IDB_NAME); }catch(e){ console.warn(e); }
   localStorage.removeItem(STORAGE_KEY);
+  let cloudCleanupFailed = false;
   if(FIREBASE_ENABLED && usersCollRef){
+    // Se detienen los listeners en vivo ANTES de borrar: si siguen activos mientras se borra,
+    // pueden "revivir" localmente cuentas que sí se eliminaron en la nube (o, si el borrado
+    // falla por Reglas de Firestore, dejan ver como si nada se hubiera borrado). Se vuelven a
+    // activar después, ya con el estado limpio.
+    if(unsubUsers){ unsubUsers(); unsubUsers = null; }
+    if(unsubCohortHistory){ unsubCohortHistory(); unsubCohortHistory = null; }
+    if(unsubLiveQuizHistory){ unsubLiveQuizHistory(); unsubLiveQuizHistory = null; }
     try{
       const usersSnap = await usersCollRef.get();
-      await Promise.all(usersSnap.docs.map(d=>d.ref.delete()));
+      const userResults = await Promise.allSettled(usersSnap.docs.map(d=>d.ref.delete()));
       const histSnap = await cohortHistoryCollRef.get();
-      await Promise.all(histSnap.docs.map(d=>d.ref.delete()));
+      const histResults = await Promise.allSettled(histSnap.docs.map(d=>d.ref.delete()));
       const liveQuizSnap = await liveQuizzesCollRef.get();
-      await Promise.all(liveQuizSnap.docs.map(d=>d.ref.delete()));
+      const liveQuizResults = await Promise.allSettled(liveQuizSnap.docs.map(d=>d.ref.delete()));
       const liveQuizHistSnap = await liveQuizHistoryCollRef.get();
-      await Promise.all(liveQuizHistSnap.docs.map(d=>d.ref.delete()));
-    }catch(e){ console.error('Error limpiando la nube durante el reinicio:', e); }
+      const liveQuizHistResults = await Promise.allSettled(liveQuizHistSnap.docs.map(d=>d.ref.delete()));
+      const allResults = [...userResults, ...histResults, ...liveQuizResults, ...liveQuizHistResults];
+      const failures = allResults.filter(r=>r.status==='rejected');
+      if(failures.length){
+        cloudCleanupFailed = true;
+        console.error('Fallaron '+failures.length+' de '+allResults.length+' eliminaciones en la nube durante el reinicio. Primer error:', failures[0].reason);
+      }
+    }catch(e){ cloudCleanupFailed = true; console.error('Error limpiando la nube durante el reinicio:', e); }
   }
   DB = defaultState();
   saveState(DB);
   if(FIREBASE_ENABLED && configDocRef){ try{ await configDocRef.set(configSnapshotFromDB()); }catch(e){ console.error(e); } }
+  if(FIREBASE_ENABLED && !cloudCleanupFailed){ subscribeToRemoteChanges(); } // reactivar sincronización ya con datos limpios
   SESSION = {};
   saveSession(SESSION);
   closeModal();
-  toast('Plataforma restablecida a datos de fábrica', 'ok');
+  if(cloudCleanupFailed){
+    toast('⚠️ Se restableció este dispositivo, pero algunas cuentas NO se pudieron borrar de la nube compartida (posible bloqueo de las Reglas de Firestore). Pueden reaparecer al reconectar. Revisa la consola de Firebase.', 'warn');
+  } else {
+    toast('Plataforma restablecida a datos de fábrica', 'ok');
+  }
   navigate('entry');
 }
 
@@ -3986,7 +4061,18 @@ function renderModulePlayer(moduleId){
   const m = DB.modules.find(m=>m.id===moduleId);
   if(!user || !m){ navigate('userHome'); return; }
   if(!isModuleUnlocked(m)){ toast('Tu entrenador/a aún no habilitó este módulo.', 'warn'); navigate('userHome'); return; }
-  if(m.type!=='flashcards' && !canAttemptModule(user, m)){ toast('Ya no tienes intentos disponibles para este módulo. Pídele a tu entrenador/a que te habilite otro.', 'warn'); navigate('userHome'); return; }
+  if(m.type!=='flashcards' && !canAttemptModule(user, m)){
+    // Antes esto mostraba un mensaje y devolvía a la persona a su ruta de inmediato, sin que
+    // ella hiciera nada — se sentía como que la "botaba" de la pantalla sin avisar. Ahora se
+    // muestra el mismo resultado de su último intento, con un botón para volver cuando ella
+    // decida, igual que al terminar un módulo por primera vez.
+    const prog = user.progress[m.id];
+    clearQuizTimer(); clearPlayerAudio();
+    playerShell(m, resultScreenHTML(m, prog? prog.score : 0, prog && prog.score>=70, null,
+      prog? { attemptNumber: prog.bestAttemptNumber, roundedScore: prog.score, bestAttempt: { attempt: prog.bestAttemptNumber, score: prog.score } } : null,
+      false));
+    return;
+  }
   clearQuizTimer();
   clearPlayerAudio();
   PLAYER_STATE = { moduleId, startedAt: Date.now() };
