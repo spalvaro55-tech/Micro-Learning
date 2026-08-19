@@ -145,6 +145,37 @@
   .flip-card.flipped .flip-inner{ transform:rotateY(180deg); }
   .flip-face{ backface-visibility:hidden; }
   .flip-back{ position:absolute; inset:0; transform:rotateY(180deg); backface-visibility:hidden; }
+
+  /* ---- Navegación por carpetas + vista mosaico/lista ---- */
+  .folder-grid{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.75rem; }
+  @media (min-width:640px){ .folder-grid{ grid-template-columns:repeat(3,minmax(0,1fr)); } }
+  @media (min-width:900px){ .folder-grid{ grid-template-columns:repeat(4,minmax(0,1fr)); } }
+  .folder-tile{ background:#fff; border:1.5px solid #E7ECF6; border-radius:1.1rem; padding:1rem .9rem; text-align:left; transition:.15s ease; display:flex; flex-direction:column; gap:.35rem; }
+  .folder-tile:hover{ border-color:#001EB4; box-shadow:0 8px 20px rgba(0,8,31,.10); transform:translateY(-2px); }
+  .folder-tile-icon{ width:2.4rem; height:2.4rem; border-radius:.75rem; background:rgba(0,30,180,.08); display:flex; align-items:center; justify-content:center; font-size:1.15rem; }
+  .folder-tile-title{ font-family:'Poppins',sans-serif; font-weight:700; font-size:.85rem; color:#00005A; line-height:1.25; }
+  .folder-tile-count{ font-size:.72rem; color:#8592AD; }
+
+  .view-toggle{ display:inline-flex; background:#EDF0F9; border-radius:999px; padding:3px; gap:2px; }
+  .view-toggle-btn{ width:2rem; height:1.85rem; border-radius:999px; display:flex; align-items:center; justify-content:center; font-size:.95rem; color:#8592AD; transition:.15s ease; }
+  .view-toggle-btn.active{ background:#fff; color:#00005A; box-shadow:0 1px 4px rgba(0,8,31,.18); }
+
+  .tile-grid{ display:grid; grid-template-columns:repeat(1,minmax(0,1fr)); gap:.75rem; }
+  @media (min-width:640px){ .tile-grid{ grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  @media (min-width:1024px){ .tile-grid{ grid-template-columns:repeat(3,minmax(0,1fr)); } }
+
+  .folder-header-btn{ width:100%; display:flex; align-items:center; justify-content:space-between; gap:.5rem; }
+  .folder-caret{ display:inline-block; transition:transform .2s ease; color:#8592AD; }
+  .folder-caret.open{ transform:rotate(90deg); }
+
+  /* Interruptor simple (para la acción única de habilitar/deshabilitar que ve el entrenador) */
+  .switch{ position:relative; display:inline-block; width:2.65rem; height:1.55rem; flex-shrink:0; }
+  .switch input{ opacity:0; width:0; height:0; position:absolute; }
+  .switch-track{ position:absolute; inset:0; background:#DCE4F2; border-radius:999px; transition:.2s ease; cursor:pointer; }
+  .switch-track::before{ content:''; position:absolute; width:1.2rem; height:1.2rem; left:.18rem; top:.175rem; background:#fff; border-radius:50%; transition:.2s ease; box-shadow:0 1px 3px rgba(0,8,31,.3); }
+  .switch input:checked + .switch-track{ background:#1FA35C; }
+  .switch input:checked + .switch-track::before{ transform:translateX(1.1rem); }
+  .switch-row{ display:flex; align-items:center; gap:.6rem; }
 </style>
 </head>
 <body class="min-h-screen">
@@ -225,10 +256,25 @@ async function idbDeleteFile(key){
    Siempre mantiene además una copia en IndexedDB de este dispositivo como
    caché rápida / respaldo sin conexión.
    ========================================================================== */
-async function storeAttachment(key, blob){
+/** Adivina el tipo MIME por extensión cuando el navegador no lo reporta (blob.type vacío).
+ *  Sin esto, Supabase puede servir el archivo como "application/octet-stream" genérico, lo que
+ *  hace que el navegador no sepa mostrarlo (iframe con contenido ilegible tipo "código") y
+ *  fuerce la descarga en vez de abrirlo en pestaña nueva. */
+function guessMimeType(fileName, fallbackType){
+  if(fallbackType) return fallbackType;
+  const ext = (fileName||'').split('.').pop().toLowerCase();
+  const map = { pdf:'application/pdf', ppt:'application/vnd.ms-powerpoint',
+    pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    doc:'application/msword', docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    mp3:'audio/mpeg', m4a:'audio/mp4', wav:'audio/wav', ogg:'audio/ogg',
+    jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png' };
+  return map[ext] || 'application/octet-stream';
+}
+async function storeAttachment(key, blob, fileName){
   try{ await idbPutFile(key, blob); }catch(e){ console.warn('No se pudo guardar la copia local del adjunto', e); }
   if(SUPABASE_ENABLED && supabaseClient){
-    const { error } = await supabaseClient.storage.from(SUPABASE_BUCKET).upload(key, blob, { upsert:true, contentType: blob.type||undefined });
+    const contentType = guessMimeType(fileName || (blob && blob.name), blob.type);
+    const { error } = await supabaseClient.storage.from(SUPABASE_BUCKET).upload(key, blob, { upsert:true, contentType });
     if(error) throw error;
   }
 }
@@ -245,6 +291,18 @@ async function fetchAttachment(key){
     }
   }
   return await idbGetFile(key);
+}
+/** URL pública directa del archivo en Supabase Storage (el bucket "attachments" es público
+ *  de solo lectura). A diferencia de una blob: URL, una URL https:// real SIEMPRE se abre
+ *  correctamente en una pestaña nueva en cualquier navegador — incluidos los de celular,
+ *  donde los navegadores frecuentemente fuerzan la descarga de una blob: URL en vez de
+ *  mostrarla. Devuelve null si Supabase no está configurado (modo solo local). */
+function attachmentPublicUrl(key){
+  if(!key || !SUPABASE_ENABLED || !supabaseClient) return null;
+  try{
+    const { data } = supabaseClient.storage.from(SUPABASE_BUCKET).getPublicUrl(key);
+    return (data && data.publicUrl) || null;
+  }catch(e){ console.warn('No se pudo generar la URL pública del adjunto:', e); return null; }
 }
 async function removeAttachment(key){
   if(!key) return;
@@ -508,6 +566,35 @@ let PENDING_AUDIO_FILES = {};
 let CURRENT_PREVIEW_OBJECT_URL = null;
 
 /* ==========================================================================
+   NAVEGACIÓN POR CARPETAS + VISTA MOSAICO/LISTA
+   Estado de interfaz puro (no se sincroniza a la nube): qué carpeta/sección
+   está abierta en cada pantalla, y si esa pantalla se ve en mosaico o lista.
+   La preferencia de mosaico/lista se recuerda entre sesiones (localStorage);
+   la carpeta abierta se reinicia cada vez que se entra a la pantalla.
+   -------------------------------------------------------------------------- */
+const VIEW_PREF_KEY = 'tigo_view_prefs_v1';
+function loadViewPrefs(){ try{ return JSON.parse(localStorage.getItem(VIEW_PREF_KEY)) || {}; }catch(e){ return {}; } }
+function saveViewPrefsToStorage(){ try{ localStorage.setItem(VIEW_PREF_KEY, JSON.stringify(VIEW_PREFS)); }catch(e){} }
+let VIEW_PREFS = loadViewPrefs();
+function getViewMode(scope){ return VIEW_PREFS[scope] || 'list'; }
+function setViewMode(scope, mode){ VIEW_PREFS[scope] = mode; saveViewPrefsToStorage(); render(); }
+function viewToggleHTML(scope){
+  const mode = getViewMode(scope);
+  return `<div class="view-toggle" role="group" aria-label="Cambiar tipo de vista">
+    <button type="button" class="view-toggle-btn ${mode==='grid'?'active':''}" title="Vista mosaico" onclick="setViewMode('${scope}','grid')">⊞</button>
+    <button type="button" class="view-toggle-btn ${mode==='list'?'active':''}" title="Vista de lista" onclick="setViewMode('${scope}','list')">☰</button>
+  </div>`;
+}
+let OPEN_FOLDER = {}; // { [scopeKey]: folderId|null } — no persiste entre sesiones a propósito
+function setOpenFolder(scopeKey, folderId){ OPEN_FOLDER[scopeKey] = folderId; render(); }
+let COLLAPSED_SECTIONS = {}; // { [sectionId]: true } si la carpeta está colapsada (paneles de gestión de Maestro/Entrenador)
+function toggleSectionCollapsed(id){ COLLAPSED_SECTIONS[id] = !COLLAPSED_SECTIONS[id]; render(); }
+/** Interruptor visual simple de una sola acción (para reemplazar filas de varios botones ambiguos) */
+function switchHTML(id, checked, onchange){
+  return `<label class="switch"><input type="checkbox" id="${id}" ${checked?'checked':''} onchange="${onchange}"><span class="switch-track"></span></label>`;
+}
+
+/* ==========================================================================
    1.2) BASE DE DATOS COMPARTIDA EN LA NUBE (Firebase Firestore)
 
    Pensado para escala real de "aula virtual": hasta 16 entrenadores con
@@ -693,6 +780,53 @@ function persistLiveQuizHistoryEntry(entry){
   liveQuizHistoryCollRef.doc(entry.id).set(entry).catch(e=>console.error('Error guardando historial de competencia en la nube:', e));
 }
 
+/* --------------------------------------------------------------------------
+   4.1) RE-RENDER COALESCIDO PARA CAMBIOS REMOTOS
+   Antes, cada snapshot de Firestore llamaba a render() de inmediato. Con
+   muchos asesores/entrenadores conectados a la vez, eso significa que CADA
+   escritura de CUALQUIER persona (una respuesta de quiz, un progreso, etc.)
+   reconstruye la pantalla completa de TODOS los demás en el instante — eso
+   es lo que se percibía como "parpadeo"/pestañeo y, con más gente conectada,
+   como que la app se cuelga (decenas de reconstrucciones completas por
+   segundo). Ahora los cambios remotos se agrupan en una sola actualización
+   cada ~600ms, y si la persona está escribiendo algo (input/textarea/select)
+   en ese momento, la actualización se pospone hasta que termine de escribir
+   en vez de interrumpirla.
+   -------------------------------------------------------------------------- */
+let _remoteRenderTimer = null;
+let _remoteRenderPending = false;
+function scheduleRemoteRender(){
+  cloudSyncStatus = 'synced';
+  clearTimeout(_remoteRenderTimer);
+  _remoteRenderTimer = setTimeout(()=>{
+    const active = document.activeElement;
+    const isTyping = active && $app && $app.contains(active) && ['INPUT','TEXTAREA','SELECT'].includes(active.tagName);
+    if(isTyping){
+      _remoteRenderPending = true;
+      updateSyncBadge();
+      return;
+    }
+    _remoteRenderPending = false;
+    render();
+  }, 600);
+}
+document.addEventListener('focusout', (e)=>{
+  if(!_remoteRenderPending) return;
+  if(!$app || !$app.contains(e.target)) return;
+  // Pequeño respiro para no cortar un clic/click de botón inmediatamente después del blur.
+  // Antes de renderizar, se revisa de nuevo si la persona ya saltó a OTRO campo de texto
+  // (ej. de "título" a "descripción" de un comunicado): si es así, se espera a que también
+  // salga de ese, para no borrar lo que acaba de escribir ahí.
+  setTimeout(()=>{
+    if(!_remoteRenderPending) return;
+    const active = document.activeElement;
+    const stillTyping = active && $app && $app.contains(active) && ['INPUT','TEXTAREA','SELECT'].includes(active.tagName);
+    if(stillTyping) return;
+    _remoteRenderPending = false;
+    render();
+  }, 150);
+});
+
 function subscribeToRemoteChanges(){
   if(unsubConfig) unsubConfig();
   unsubConfig = configDocRef.onSnapshot(snap=>{
@@ -701,8 +835,7 @@ function subscribeToRemoteChanges(){
     Object.assign(DB, cfg);
     ensureStateShape(DB);
     saveState(DB);
-    cloudSyncStatus = 'synced';
-    render();
+    scheduleRemoteRender();
   }, err=>{ console.error('Error de sincronización (config):', err); cloudSyncStatus='error'; updateSyncBadge(); });
 
   if(unsubUsers) unsubUsers();
@@ -718,8 +851,7 @@ function subscribeToRemoteChanges(){
       }
     });
     saveState(DB);
-    cloudSyncStatus = 'synced';
-    render();
+    scheduleRemoteRender();
   }, err=>{ console.error('Error de sincronización (asesores):', err); cloudSyncStatus='error'; updateSyncBadge(); });
 
   if(unsubCohortHistory) unsubCohortHistory();
@@ -735,7 +867,7 @@ function subscribeToRemoteChanges(){
       }
     });
     saveState(DB);
-    render();
+    scheduleRemoteRender();
   }, err=>{ console.error('Error de sincronización (historial):', err); });
 
   if(unsubLiveQuizHistory) unsubLiveQuizHistory();
@@ -751,7 +883,7 @@ function subscribeToRemoteChanges(){
       }
     });
     saveState(DB);
-    render();
+    scheduleRemoteRender();
   }, err=>{ console.error('Error de sincronización (historial de competencias):', err); });
 }
 
@@ -1764,53 +1896,102 @@ function cmsHTML(scopeCountry, role){
   const sections = sectionsForScope(scopeCountry);
   const bySection = {}; const noSection = [];
   mods.forEach(m=>{ if(m.sectionId && sections.some(s=>s.id===m.sectionId)) (bySection[m.sectionId]=bySection[m.sectionId]||[]).push(m); else noSection.push(m); });
+  const VIEW_SCOPE = 'cms_' + (scopeCountry===null? 'ALL' : scopeCountry);
+  const mode = getViewMode(VIEW_SCOPE);
 
-  const moduleRowHTML = (m,i)=>{
+  /* Acciones por módulo:
+     - Entrenador/a: UN SOLO interruptor ("Disponible para asesores"). Nada de "desaparecer"
+       el módulo por separado — eso solo confunde con tantos botones.
+     - Maestro: mismo interruptor + un segundo interruptor de "Activo en el catálogo"
+       (retirar un módulo por completo de las seis operaciones), claramente etiquetados. */
+  const moduleActionsHTML = (m, editable)=>{
+    if(!editable){
+      return role==='trainer'
+        ? `<button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="cloneModuleToMyCountry('${m.id}')">📋 Duplicar a mi país</button>`
+        : `<span class="text-xs text-slate-400 italic pr-1">Solo lectura</span>`;
+    }
+    const releasedSwitch = `
+      <div class="switch-row">
+        ${switchHTML('rel-'+m.id, m.releasedForAdvisors!==false, `toggleModuleReleased('${m.id}')`)}
+        <span class="text-xs text-slate-600">Disponible para asesores</span>
+      </div>`;
+    const enabledSwitch = role==='master' ? `
+      <div class="switch-row">
+        ${switchHTML('en-'+m.id, !!m.enabled, `toggleModule('${m.id}')`)}
+        <span class="text-xs text-slate-600">Activo en el catálogo</span>
+      </div>` : '';
+    return `
+      <div class="flex flex-col gap-2">${releasedSwitch}${enabledSwitch}</div>
+      <button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="openEditModuleModal('${m.id}')">Editar</button>
+      <button class="btn px-3 py-2 rounded-full text-xs bg-bad/10 text-bad" onclick="confirmDeleteModule('${m.id}')">Eliminar</button>`;
+  };
+
+  const moduleRowHTML = (m,i,list,sectionKey)=>{
     const editable = canEditModule(m);
+    const scopeArg = scopeCountry===null?'null':`'${scopeCountry}'`;
     return `
     <div class="card p-5 flex flex-col sm:flex-row sm:items-center gap-4">
       <div class="flex flex-col gap-1 shrink-0">
-        <button class="text-slate-300 hover:text-tigo-700 disabled:opacity-20" ${(!editable||i===0)?'disabled':''} onclick="moveModuleScoped('${m.id}',-1,${scopeCountry===null?'null':`'${scopeCountry}'`})">▲</button>
-        <button class="text-slate-300 hover:text-tigo-700 disabled:opacity-20" ${(!editable||i===mods.length-1)?'disabled':''} onclick="moveModuleScoped('${m.id}',1,${scopeCountry===null?'null':`'${scopeCountry}'`})">▼</button>
+        <button class="text-slate-300 hover:text-tigo-700 disabled:opacity-20" ${(!editable||i===0)?'disabled':''} onclick="moveModuleScoped('${m.id}',-1,${scopeArg},'${sectionKey}')">▲</button>
+        <button class="text-slate-300 hover:text-tigo-700 disabled:opacity-20" ${(!editable||i===list.length-1)?'disabled':''} onclick="moveModuleScoped('${m.id}',1,${scopeArg},'${sectionKey}')">▼</button>
       </div>
       <div class="w-10 h-10 rounded-lg bg-tigo-cyan-500/10 flex items-center justify-center text-xl shrink-0">${moduleIcon(m.type)}</div>
       <div class="flex-1 min-w-0">
         <div class="flex flex-wrap items-center gap-2">
           <p class="font-display font-semibold text-tigo-900 truncate">${escapeHTML(m.title)}</p>
-          <span class="chip ${m.enabled? 'bg-ok/10 text-ok':'bg-slate-200 text-slate-500'}">${m.enabled?'Activo':'Deshabilitado'}</span>
-          <span class="chip ${m.releasedForAdvisors!==false? 'bg-tigo-cyan-500/10 text-tigo-cyan-600':'bg-warn/10 text-warn'}">${m.releasedForAdvisors!==false? '👁️ Visible para asesores':'🔒 Oculto para asesores'}</span>
           <span class="chip bg-tigo-700/10 text-tigo-700">${moduleTypeLabel(m.type)}</span>
           <span class="chip bg-slate-100 text-slate-500">${m.country==='ALL'? '🌎 Todos los países' : countryFlag(m.country)+' '+countryName(m.country)}</span>
           ${!editable? `<span class="chip bg-gold/10 text-gold">🔒 Casa Matriz</span>` : ''}
         </div>
         <p class="text-sm text-slate-500 mt-1 truncate">${escapeHTML(m.description||'')}</p>
       </div>
-      <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
-        ${editable? `
-          <button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="toggleModuleReleased('${m.id}')">${m.releasedForAdvisors!==false? 'Ocultar':'Habilitar'} para asesores</button>
-          <button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="openEditModuleModal('${m.id}')">Editar</button>
-          <button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="toggleModule('${m.id}')">${m.enabled?'Deshabilitar':'Habilitar'}</button>
-          <button class="btn px-3 py-2 rounded-full text-xs bg-bad/10 text-bad" onclick="confirmDeleteModule('${m.id}')">Eliminar</button>
-        ` : (role==='trainer' ? `<button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="cloneModuleToMyCountry('${m.id}')">📋 Duplicar a mi país</button>` : `<span class="text-xs text-slate-400 italic pr-1">Solo lectura</span>`)}
-      </div>
+      <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">${moduleActionsHTML(m, editable)}</div>
     </div>`;
   };
+  const moduleTileHTML = (m,i,list,sectionKey)=>{
+    const editable = canEditModule(m);
+    const scopeArg = scopeCountry===null?'null':`'${scopeCountry}'`;
+    return `
+    <div class="card p-4 flex flex-col gap-2">
+      <div class="flex items-center justify-between">
+        <div class="w-10 h-10 rounded-lg bg-tigo-cyan-500/10 flex items-center justify-center text-lg shrink-0">${moduleIcon(m.type)}</div>
+        <div class="flex flex-col gap-0.5 items-end">
+          <button class="text-slate-300 hover:text-tigo-700 disabled:opacity-20 text-xs" ${(!editable||i===0)?'disabled':''} onclick="moveModuleScoped('${m.id}',-1,${scopeArg},'${sectionKey}')">▲</button>
+          <button class="text-slate-300 hover:text-tigo-700 disabled:opacity-20 text-xs" ${(!editable||i===list.length-1)?'disabled':''} onclick="moveModuleScoped('${m.id}',1,${scopeArg},'${sectionKey}')">▼</button>
+        </div>
+      </div>
+      <p class="font-display font-semibold text-sm text-tigo-900 truncate">${escapeHTML(m.title)}</p>
+      <p class="text-xs text-slate-500 line-clamp-2">${escapeHTML(m.description||'')}</p>
+      <div class="flex flex-wrap gap-1.5">
+        <span class="chip bg-tigo-700/10 text-tigo-700">${moduleTypeLabel(m.type)}</span>
+        ${!editable? `<span class="chip bg-gold/10 text-gold">🔒 Casa Matriz</span>` : ''}
+      </div>
+      <div class="flex flex-col gap-2 pt-1 border-t border-slate-100 mt-1">${moduleActionsHTML(m, editable)}</div>
+    </div>`;
+  };
+  const renderModuleList = (list, sectionKey)=> mode==='grid'
+    ? `<div class="tile-grid">${list.map((m,i)=>moduleTileHTML(m,i,list,sectionKey)).join('')}</div>`
+    : `<div class="space-y-3">${list.map((m,i)=>moduleRowHTML(m,i,list,sectionKey)).join('')}</div>`;
 
   const sectionGroupsHTML = sections.map(sec=>{
     const secMods = bySection[sec.id] || [];
     const secEditable = role==='master' || sec.country===scopeCountry;
+    const collapsed = !!COLLAPSED_SECTIONS[sec.id];
     return `
     <div class="space-y-3">
       <div class="flex flex-wrap items-center justify-between gap-2 bg-slate-50 rounded-xl px-4 py-2.5">
-        <p class="font-display font-bold text-tigo-900 text-sm">🗂️ ${escapeHTML(sec.title)} <span class="text-slate-400 font-normal">(${secMods.length} módulo${secMods.length!==1?'s':''})</span></p>
-        ${secEditable? `<div class="flex gap-2">
+        <button class="folder-header-btn text-left" onclick="toggleSectionCollapsed('${sec.id}')">
+          <span class="font-display font-bold text-tigo-900 text-sm">🗂️ ${escapeHTML(sec.title)} <span class="text-slate-400 font-normal">(${secMods.length} módulo${secMods.length!==1?'s':''})</span></span>
+          <span class="folder-caret ${collapsed?'':'open'}">▶</span>
+        </button>
+        ${secEditable? `<div class="flex gap-2 flex-wrap">
           <button class="btn btn-ghost px-3 py-1.5 rounded-full text-[11px]" onclick="releaseSectionModules('${sec.id}', true)">👁️ Habilitar sección</button>
           <button class="btn btn-ghost px-3 py-1.5 rounded-full text-[11px]" onclick="releaseSectionModules('${sec.id}', false)">🔒 Ocultar sección</button>
           <button class="btn btn-ghost px-3 py-1.5 rounded-full text-[11px]" onclick="renameSection('${sec.id}')">Renombrar</button>
           <button class="btn px-3 py-1.5 rounded-full text-[11px] bg-bad/10 text-bad" onclick="confirmDeleteSection('${sec.id}')">Eliminar sección</button>
         </div>` : ''}
       </div>
-      ${secMods.length? secMods.map((m,i)=>moduleRowHTML(m,i)).join('') : '<p class="text-xs text-slate-400 px-2">Sin módulos asignados todavía. Edita un módulo y asígnale esta sección.</p>'}
+      ${collapsed? '' : (secMods.length? renderModuleList(secMods, sec.id) : '<p class="text-xs text-slate-400 px-2">Sin módulos asignados todavía. Edita un módulo y asígnale esta sección.</p>')}
     </div>`;
   }).join('');
 
@@ -1821,8 +2002,9 @@ function cmsHTML(scopeCountry, role){
         <p class="font-display font-bold text-tigo-900 text-lg">Gestión de Módulos</p>
         <p class="text-xs text-slate-400">${role==='master' ? 'Módulos de las seis operaciones. Los módulos "Todos los países" son estándar corporativo.' : 'Módulos globales de Casa Matriz (solo lectura) + módulos propios de tu operación (editables). Puedes duplicar un módulo global para personalizarlo.'}</p>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex items-center gap-2 flex-wrap">
         ${role==='master' ? countryFilterSelectHTML(scopeCountry, 'setCmsFilter') : ''}
+        ${viewToggleHTML(VIEW_SCOPE)}
         <button class="btn btn-primary px-4 py-2 rounded-full text-sm" onclick="openNewModuleModal()">+ Nuevo módulo</button>
       </div>
     </div>
@@ -1831,7 +2013,7 @@ function cmsHTML(scopeCountry, role){
       <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
         <div>
           <p class="font-display font-semibold text-tigo-900 text-sm">🗂️ Secciones por servicio</p>
-          <p class="text-xs text-slate-400">Agrupa tus módulos por tema (ej. "Móvil", "Home") para organizar la ruta del asesor.</p>
+          <p class="text-xs text-slate-400">Agrupa tus módulos por tema (ej. "Móvil", "Home") para organizar la ruta del asesor. Toca una carpeta abajo para expandirla o colapsarla.</p>
         </div>
         <button class="btn btn-ghost px-3 py-1.5 rounded-full text-xs" onclick="openNewSectionModal()">+ Nueva sección</button>
       </div>
@@ -1843,15 +2025,25 @@ function cmsHTML(scopeCountry, role){
       ${noSection.length? `
       <div class="space-y-3">
         ${sections.length? `<p class="font-display font-bold text-tigo-900 text-sm bg-slate-50 rounded-xl px-4 py-2.5">📄 Sin sección</p>` : ''}
-        ${noSection.map((m,i)=>moduleRowHTML(m,i)).join('')}
+        ${renderModuleList(noSection, '__none__')}
       </div>` : ''}
       ${!mods.length? '<p class="text-sm text-slate-400">No hay módulos configurados.</p>' : ''}
     </div>
   </div>`;
 }
 
-function moveModuleScoped(id, dir, scopeCountry){
-  const list = modulesForScope(scopeCountry);
+function moveModuleScoped(id, dir, scopeCountry, sectionKey){
+  let list = modulesForScope(scopeCountry);
+  if(sectionKey !== undefined && sectionKey !== null){
+    // Reordena SOLO dentro de la misma carpeta/sección que se está viendo, no contra
+    // el listado global — si no, la flecha podía "saltar" el módulo a otra sección
+    // invisible (colapsada) sin que la persona lo notara.
+    const sections = sectionsForScope(scopeCountry);
+    list = list.filter(m=>{
+      const hasRealSection = m.sectionId && sections.some(s=>s.id===m.sectionId);
+      return sectionKey==='__none__' ? !hasRealSection : m.sectionId===sectionKey;
+    });
+  }
   const idx = list.findIndex(m=>m.id===id);
   const swapIdx = idx+dir;
   if(idx<0 || swapIdx<0 || swapIdx>=list.length) return;
@@ -2376,8 +2568,65 @@ function fileKindLabel(fileType){
   return 'Archivo';
 }
 
+function materialCardHTML(mt, editable, role){
+  return `
+  <div class="card p-5">
+    <div class="flex items-start justify-between gap-2 mb-2">
+      <div class="w-10 h-10 rounded-lg bg-tigo-cyan-500/10 flex items-center justify-center text-xl shrink-0">${categoryIcon(mt.category)}</div>
+      <div class="flex flex-wrap gap-1 justify-end">
+        <span class="chip bg-slate-100 text-slate-500">${mt.country==='ALL'?'🌎 Global':countryName(mt.country)}</span>
+        ${mt.fileRef? `<span class="chip bg-gold/10 text-gold">📎 ${fileKindLabel(mt.fileType)} · ${formatFileSize(mt.fileSize)}</span>`:''}
+      </div>
+    </div>
+    <p class="font-display font-semibold text-tigo-900">${escapeHTML(mt.title)}</p>
+    <p class="text-sm text-slate-500 mt-1 line-clamp-3">${escapeHTML((mt.body||'').slice(0,140))}${mt.body && mt.body.length>140?'…':''}</p>
+    <div class="flex items-center justify-between gap-2 mt-4 flex-wrap">
+      <button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="openReadMaterialModal('${mt.id}')">Vista previa</button>
+      ${editable? `
+        <div class="flex items-center gap-2 flex-wrap">
+          <div class="switch-row">${switchHTML('matrel-'+mt.id, mt.releasedForAdvisors!==false, `toggleMaterialReleased('${mt.id}')`)}<span class="text-xs text-slate-600">Visible</span></div>
+          <button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="openEditMaterialModal('${mt.id}')">Editar</button>
+          <button class="btn px-3 py-2 rounded-full text-xs bg-bad/10 text-bad" onclick="confirmDeleteMaterial('${mt.id}')">Eliminar</button>
+        </div>
+      ` : (role==='trainer' ? `<button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="cloneMaterialToMyCountry('${mt.id}')">📋 Duplicar a mi país</button>` : `<span class="text-xs text-slate-400 italic">Solo lectura</span>`)}
+    </div>
+  </div>`;
+}
 function materialsHTML(scopeCountry, role){
   const mats = materialsForScope(scopeCountry);
+  const VIEW_SCOPE = 'materials_' + (scopeCountry===null? 'ALL' : scopeCountry);
+  const mode = getViewMode(VIEW_SCOPE);
+  const byCategory = {};
+  mats.forEach(mt=>{ (byCategory[mt.category]=byCategory[mt.category]||[]).push(mt); });
+  const folders = MATERIAL_CATEGORIES.filter(c=>byCategory[c] && byCategory[c].length)
+    .map(c=>({ id:c, title:c, icon:categoryIcon(c), items:byCategory[c] }));
+  const SCOPE = 'materialsFolder_' + (scopeCountry===null? 'ALL' : scopeCountry);
+  const openId = OPEN_FOLDER[SCOPE];
+  const openFolder = folders.find(f=>f.id===openId);
+
+  const listHTML = (items)=> mode==='list'
+    ? `<div class="space-y-3">${items.map(mt=>materialCardHTML(mt, canEditMaterial(mt), role)).join('')}</div>`
+    : `<div class="grid sm:grid-cols-2 gap-4">${items.map(mt=>materialCardHTML(mt, canEditMaterial(mt), role)).join('')}</div>`;
+
+  let bodyHTML;
+  if(!mats.length){
+    bodyHTML = '<p class="text-sm text-slate-400">Aún no hay materiales cargados.</p>';
+  } else if(folders.length<=1){
+    bodyHTML = listHTML(mats);
+  } else if(!openFolder){
+    bodyHTML = `<div class="folder-grid">${folders.map(f=>`
+      <button class="folder-tile" onclick="setOpenFolder('${SCOPE}','${f.id}')">
+        <div class="folder-tile-icon">${f.icon}</div>
+        <p class="folder-tile-title">${escapeHTML(f.title)}</p>
+        <p class="folder-tile-count">${f.items.length} archivo${f.items.length!==1?'s':''}</p>
+      </button>`).join('')}</div>`;
+  } else {
+    bodyHTML = `
+      <button class="text-xs font-display font-semibold text-tigo-600 mb-3" onclick="setOpenFolder('${SCOPE}', null)">← Todas las categorías</button>
+      <p class="font-display font-bold text-tigo-900 text-sm mb-3">${openFolder.icon} ${escapeHTML(openFolder.title)}</p>
+      ${listHTML(openFolder.items)}`;
+  }
+
   return `
   <div class="fade-in space-y-5">
     <div class="flex flex-wrap items-center justify-between gap-3">
@@ -2385,39 +2634,13 @@ function materialsHTML(scopeCountry, role){
         <p class="font-display font-bold text-tigo-900 text-lg">Contenido y Materiales</p>
         <p class="text-xs text-slate-400">${role==='master' ? 'Biblioteca de recursos teórico/prácticos de las seis operaciones.' : 'Sube guías, manuales, políticas, PDF o PPT (incluso con imágenes o video incrustado) de referencia para tus asesores.'}</p>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex items-center gap-2 flex-wrap">
         ${role==='master' ? countryFilterSelectHTML(scopeCountry, 'setMaterialsFilter') : ''}
+        ${viewToggleHTML(VIEW_SCOPE)}
         <button class="btn btn-primary px-4 py-2 rounded-full text-sm" onclick="openNewMaterialModal()">+ Nuevo material</button>
       </div>
     </div>
-
-    <div class="grid sm:grid-cols-2 gap-4">
-      ${mats.map(mt=>{
-        const editable = canEditMaterial(mt);
-        return `
-        <div class="card p-5">
-          <div class="flex items-start justify-between gap-2 mb-2">
-            <div class="w-10 h-10 rounded-lg bg-tigo-cyan-500/10 flex items-center justify-center text-xl shrink-0">${categoryIcon(mt.category)}</div>
-            <div class="flex flex-wrap gap-1 justify-end">
-              <span class="chip bg-tigo-700/10 text-tigo-700">${mt.category}</span>
-              <span class="chip bg-slate-100 text-slate-500">${mt.country==='ALL'?'🌎 Global':countryName(mt.country)}</span>
-              <span class="chip ${mt.releasedForAdvisors!==false? 'bg-tigo-cyan-500/10 text-tigo-cyan-600':'bg-warn/10 text-warn'}">${mt.releasedForAdvisors!==false? '👁️ Visible':'🔒 Oculto'}</span>
-              ${mt.fileRef? `<span class="chip bg-gold/10 text-gold">📎 ${fileKindLabel(mt.fileType)} · ${formatFileSize(mt.fileSize)}</span>`:''}
-            </div>
-          </div>
-          <p class="font-display font-semibold text-tigo-900">${escapeHTML(mt.title)}</p>
-          <p class="text-sm text-slate-500 mt-1 line-clamp-3">${escapeHTML((mt.body||'').slice(0,140))}${mt.body && mt.body.length>140?'…':''}</p>
-          <div class="flex items-center gap-2 mt-4 flex-wrap">
-            <button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="openReadMaterialModal('${mt.id}')">Vista previa</button>
-            ${editable? `
-              <button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="toggleMaterialReleased('${mt.id}')">${mt.releasedForAdvisors!==false? 'Ocultar':'Habilitar'}</button>
-              <button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="openEditMaterialModal('${mt.id}')">Editar</button>
-              <button class="btn px-3 py-2 rounded-full text-xs bg-bad/10 text-bad" onclick="confirmDeleteMaterial('${mt.id}')">Eliminar</button>
-            ` : (role==='trainer' ? `<button class="btn btn-ghost px-3 py-2 rounded-full text-xs" onclick="cloneMaterialToMyCountry('${mt.id}')">📋 Duplicar a mi país</button>` : `<span class="text-xs text-slate-400 italic">Solo lectura</span>`)}
-          </div>
-        </div>`;
-      }).join('') || '<p class="text-sm text-slate-400 sm:col-span-2">Aún no hay materiales cargados.</p>'}
-    </div>
+    ${bodyHTML}
   </div>`;
 }
 
@@ -2523,7 +2746,7 @@ async function saveMaterial(id){
     } else if(PENDING_MATERIAL_FILE){
       if(saveBtn){ saveBtn.disabled = true; saveBtn.textContent = 'Guardando archivo...'; }
       fileRef = uid('att');
-      await storeAttachment(fileRef, PENDING_MATERIAL_FILE.blob);
+      await storeAttachment(fileRef, PENDING_MATERIAL_FILE.blob, PENDING_MATERIAL_FILE.name);
       fileName = PENDING_MATERIAL_FILE.name; fileType = PENDING_MATERIAL_FILE.type; fileSize = PENDING_MATERIAL_FILE.size;
     } else if(existing){
       fileRef = existing.fileRef; fileName = existing.fileName; fileType = existing.fileType; fileSize = existing.fileSize;
@@ -2587,15 +2810,16 @@ async function openReadMaterialModal(id){
   try{
     const blob = await fetchAttachment(mt.fileRef);
     if(!blob){ throw new Error('Adjunto no encontrado'); }
+    if(blob.size === 0){ throw new Error('Adjunto vacío o dañado'); }
     if(CURRENT_PREVIEW_OBJECT_URL){ URL.revokeObjectURL(CURRENT_PREVIEW_OBJECT_URL); }
     CURRENT_PREVIEW_OBJECT_URL = URL.createObjectURL(blob);
     const area = document.getElementById('mat-attachment-area');
     if(!area) return; // el modal pudo haberse cerrado mientras cargaba
-    area.innerHTML = attachmentPreviewHTML(mt, CURRENT_PREVIEW_OBJECT_URL);
+    area.innerHTML = attachmentPreviewHTML(mt, CURRENT_PREVIEW_OBJECT_URL, attachmentPublicUrl(mt.fileRef));
   }catch(e){
     console.error(e);
     const area = document.getElementById('mat-attachment-area');
-    if(area) area.innerHTML = `<p class="text-xs text-bad mt-5">No se pudo cargar el archivo adjunto. Puede haberse eliminado del almacenamiento de este dispositivo.</p>`;
+    if(area) area.innerHTML = `<p class="text-xs text-bad mt-5">No se pudo cargar el archivo adjunto. Puede estar vacío, dañado, o haberse eliminado del almacenamiento.</p>`;
   }
 }
 
@@ -3429,42 +3653,92 @@ function groupedModulesHTML(user, modList){
       noSection.push(m);
     }
   });
-  const moduleRowHTML = (m, idx)=>{
+  if(modList.length===0) return '<p class="text-sm text-slate-400">No hay módulos disponibles para tu operación.</p>';
+
+  const moduleStatus = (m)=>{
     const prog = user.progress[m.id];
     const unlocked = isModuleUnlocked(m);
     const completed = prog && prog.completed;
-    const retryExempt = m.type==='flashcards'; // las flashcards son de práctica libre, no cuentan intentos
+    const retryExempt = m.type==='flashcards';
     const canRetry = retryExempt || canAttemptModule(user, m);
     const clickable = unlocked && (!completed || canRetry);
-    let statusChip;
-    if(completed && !canRetry) statusChip = `<span class="chip bg-warn/10 text-warn">Completado · ${prog.score} pts · sin más intentos</span>`;
-    else if(completed) statusChip = `<span class="chip bg-ok/10 text-ok">Completado · ${prog.score} pts${prog.attempts>1? ' · Intento '+prog.bestAttemptNumber+'/'+prog.attempts : ''}</span>`;
-    else if(unlocked) statusChip = `<span class="chip bg-tigo-cyan-500/10 text-tigo-cyan-600">Disponible</span>`;
-    else statusChip = `<span class="chip bg-slate-200 text-slate-500">Aún no habilitado</span>`;
+    let chip;
+    if(completed && !canRetry) chip = `<span class="chip bg-warn/10 text-warn">Completado · ${prog.score} pts · sin más intentos</span>`;
+    else if(completed) chip = `<span class="chip bg-ok/10 text-ok">Completado · ${prog.score} pts${prog.attempts>1? ' · Intento '+prog.bestAttemptNumber+'/'+prog.attempts : ''}</span>`;
+    else if(unlocked) chip = `<span class="chip bg-tigo-cyan-500/10 text-tigo-cyan-600">Disponible</span>`;
+    else chip = `<span class="chip bg-slate-200 text-slate-500">Aún no habilitado</span>`;
+    return { clickable, chip };
+  };
+  const moduleRowHTML = (m, idx)=>{
+    const { clickable, chip } = moduleStatus(m);
     return `
     <button class="card p-5 w-full flex items-center gap-4 text-left ${clickable? 'hover:shadow-pop':'opacity-60 cursor-not-allowed'}" ${clickable?`onclick="navigate('modulePlayer',{moduleId:'${m.id}'})"`:''}>
       <div class="w-11 h-11 rounded-xl bg-tigo-700/10 flex items-center justify-center text-xl shrink-0">${moduleIcon(m.type)}</div>
       <div class="flex-1 min-w-0">
-        <div class="flex flex-wrap items-center gap-2"><p class="font-display font-semibold text-tigo-900">${idx+1}. ${escapeHTML(m.title)}</p>${statusChip}</div>
+        <div class="flex flex-wrap items-center gap-2"><p class="font-display font-semibold text-tigo-900">${idx+1}. ${escapeHTML(m.title)}</p>${chip}</div>
         <p class="text-sm text-slate-500 mt-0.5">${escapeHTML(m.description||'')}</p>
       </div>
       ${clickable? `<span class="text-tigo-cyan-500 text-lg shrink-0">→</span>` : '<span class="text-lg shrink-0">🔒</span>'}
     </button>`;
   };
-  if(modList.length===0) return '<p class="text-sm text-slate-400">No hay módulos disponibles para tu operación.</p>';
-  const sectionBlocks = sections
-    .filter(sec=>bySection[sec.id] && bySection[sec.id].length)
-    .map(sec=>`
-      <div class="space-y-3">
-        <p class="font-display font-semibold text-tigo-700 text-sm uppercase tracking-wide">${escapeHTML(sec.title)}</p>
-        ${bySection[sec.id].map((m,i)=>moduleRowHTML(m,i)).join('')}
-      </div>`).join('');
-  const generalBlock = noSection.length? `
-    <div class="space-y-3">
-      ${sectionBlocks? `<p class="font-display font-semibold text-tigo-700 text-sm uppercase tracking-wide">General</p>` : ''}
-      ${noSection.map((m,i)=>moduleRowHTML(m,i)).join('')}
-    </div>` : '';
-  return sectionBlocks + generalBlock;
+  const moduleTileHTML = (m)=>{
+    const { clickable, chip } = moduleStatus(m);
+    return `
+    <button class="card p-4 w-full text-left flex flex-col gap-2 ${clickable? 'hover:shadow-pop':'opacity-60 cursor-not-allowed'}" ${clickable?`onclick="navigate('modulePlayer',{moduleId:'${m.id}'})"`:''}>
+      <div class="flex items-center justify-between">
+        <div class="w-10 h-10 rounded-xl bg-tigo-700/10 flex items-center justify-center text-lg">${moduleIcon(m.type)}</div>
+        ${clickable? `<span class="text-tigo-cyan-500 shrink-0">→</span>` : '<span class="shrink-0">🔒</span>'}
+      </div>
+      <p class="font-display font-semibold text-sm text-tigo-900 leading-snug">${escapeHTML(m.title)}</p>
+      <div>${chip}</div>
+    </button>`;
+  };
+
+  // Carpetas disponibles: una por sección con módulos + "General" si hay módulos sueltos
+  const folders = sections.filter(sec=>bySection[sec.id] && bySection[sec.id].length)
+    .map(sec=>({ id: sec.id, title: sec.title, icon: '🗂️', mods: bySection[sec.id] }));
+  if(noSection.length) folders.push({ id: '__general__', title: folders.length? 'General' : 'Todos los módulos', icon: '📄', mods: noSection });
+
+  const SCOPE = 'advisorModules';
+  // Si solo hay una carpeta (o ninguna sección creada), no tiene sentido mostrar navegación de carpetas:
+  // se muestra la lista/mosaico directamente para no agregar un clic innecesario.
+  if(folders.length <= 1){
+    const mode = getViewMode(SCOPE);
+    const mods = folders.length? folders[0].mods : modList;
+    return `
+      <div class="flex justify-end mb-1">${viewToggleHTML(SCOPE)}</div>
+      ${mode==='grid'
+        ? `<div class="tile-grid">${mods.map(m=>moduleTileHTML(m)).join('')}</div>`
+        : `<div class="space-y-3">${mods.map((m,i)=>moduleRowHTML(m,i)).join('')}</div>`}`;
+  }
+
+  const openId = OPEN_FOLDER[SCOPE];
+  const openFolder = folders.find(f=>f.id===openId);
+
+  if(!openFolder){
+    // Vista de carpetas: una tarjeta por sección con su progreso
+    return `<div class="folder-grid">${folders.map(f=>{
+      const prog = userOverallProgress(user, f.mods);
+      return `
+      <button class="folder-tile" onclick="setOpenFolder('${SCOPE}','${f.id}')">
+        <div class="folder-tile-icon">${f.icon}</div>
+        <p class="folder-tile-title">${escapeHTML(f.title)}</p>
+        <p class="folder-tile-count">${f.mods.length} módulo${f.mods.length!==1?'s':''} · ${prog.pct}%</p>
+        <div class="progress-track h-1.5 mt-1"><div class="progress-fill" style="width:${prog.pct}%"></div></div>
+      </button>`;
+    }).join('')}</div>`;
+  }
+
+  const mode = getViewMode(SCOPE);
+  return `
+    <div class="flex items-center justify-between gap-2 flex-wrap mb-1">
+      <button class="text-xs font-display font-semibold text-tigo-600" onclick="setOpenFolder('${SCOPE}', null)">← Todas las secciones</button>
+      ${viewToggleHTML(SCOPE)}
+    </div>
+    <p class="font-display font-bold text-tigo-900 text-sm">${openFolder.icon} ${escapeHTML(openFolder.title)}</p>
+    ${mode==='grid'
+      ? `<div class="tile-grid">${openFolder.mods.map(m=>moduleTileHTML(m)).join('')}</div>`
+      : `<div class="space-y-3">${openFolder.mods.map((m,i)=>moduleRowHTML(m,i)).join('')}</div>`}`;
 }
 function renderUserHome(){
   const user = currentUser();
@@ -3576,11 +3850,13 @@ async function renderMaterialsLibrary(){
     <div class="flex-1 max-w-6xl w-full mx-auto flex flex-col sm:flex-row">
       <nav class="sm:w-72 shrink-0 bg-white border-b sm:border-b-0 sm:border-r border-slate-100">
         <div class="flex sm:flex-col gap-2 overflow-x-auto sm:overflow-visible px-4 sm:px-3 py-3 sm:py-6">
-          ${mats.length? mats.map(mt=>`
+          ${mats.length? MATERIAL_CATEGORIES.filter(cat=>mats.some(mt=>mt.category===cat)).map(cat=>`
+            <p class="hidden sm:block text-[11px] font-display font-bold text-slate-400 uppercase tracking-wide px-3 pt-2 first:pt-0">${categoryIcon(cat)} ${cat}</p>
+            ${mats.filter(mt=>mt.category===cat).map(mt=>`
             <button onclick="navigate('materialsLibrary',{materialId:'${mt.id}'})" class="text-left px-3 py-2.5 rounded-xl text-sm shrink-0 sm:shrink w-56 sm:w-full transition-colors ${mt.id===selectedId? 'bg-tigo-700 text-white':'text-slate-600 hover:bg-slate-100'}">
               <p class="font-display font-semibold truncate">${categoryIcon(mt.category)} ${escapeHTML(mt.title)}</p>
               <p class="text-[11px] ${mt.id===selectedId?'text-white/70':'text-slate-400'} mt-0.5">${mt.category}${mt.fileRef?' · 📎 '+fileKindLabel(mt.fileType):''}</p>
-            </button>`).join('') : '<p class="text-sm text-slate-400 px-3">Aún no hay materiales disponibles.</p>'}
+            </button>`).join('')}`).join('') : '<p class="text-sm text-slate-400 px-3">Aún no hay materiales disponibles.</p>'}
         </div>
       </nav>
       <main class="flex-1 min-w-0 px-5 sm:px-8 py-6" id="material-detail-panel">
@@ -3607,18 +3883,25 @@ function materialDetailPanelHTML(mt){
 }
 /** Genera el bloque de vista previa de un adjunto, siempre con botones de "Abrir"/"Descargar" visibles
  *  (en muchos navegadores de celular, especialmente iOS, el PDF embebido en un iframe no se ve —
- *  esto garantiza que siempre haya una salida clara sin depender de que el iframe funcione). */
-function attachmentPreviewHTML(mt, objectUrl){
+ *  esto garantiza que siempre haya una salida clara sin depender de que el iframe funcione).
+ *
+ *  objectUrl: blob: URL ya descargada a este dispositivo (sirve para forzar la descarga y como
+ *             respaldo sin conexión). publicUrl: URL https:// real del archivo en Supabase Storage,
+ *             cuando está disponible — se usa para "Abrir en pestaña nueva" y para el iframe, porque
+ *             una URL real SIEMPRE abre/renderiza correctamente en una pestaña nueva; una blob: URL
+ *             frecuentemente no lo hace (el navegador la descarga en vez de mostrarla). */
+function attachmentPreviewHTML(mt, objectUrl, publicUrl){
   const isPdf = mt.fileType && mt.fileType.includes('pdf');
+  const openUrl = publicUrl || objectUrl; // preferir siempre la URL real si existe
   const actions = `
     <div class="flex flex-wrap gap-2 mt-3">
-      <a href="${objectUrl}" target="_blank" rel="noopener" class="btn btn-primary px-4 py-2 rounded-full text-xs whitespace-nowrap">↗️ Abrir en pestaña nueva</a>
+      <a href="${openUrl}" target="_blank" rel="noopener" class="btn btn-primary px-4 py-2 rounded-full text-xs whitespace-nowrap">↗️ Abrir en pestaña nueva</a>
       <a href="${objectUrl}" download="${escapeHTML(mt.fileName||'archivo')}" class="btn btn-ghost px-4 py-2 rounded-full text-xs whitespace-nowrap">⬇️ Descargar</a>
     </div>`;
   if(isPdf){
     return `<div class="mt-5">
       <p class="text-xs font-semibold text-slate-500 mb-2">📎 ${escapeHTML(mt.fileName||'Documento PDF')} · ${formatFileSize(mt.fileSize)}</p>
-      <iframe src="${objectUrl}" class="w-full h-[50vh] sm:h-[65vh] rounded-lg border border-slate-200 bg-slate-50"></iframe>
+      <iframe src="${openUrl}" class="w-full h-[50vh] sm:h-[65vh] rounded-lg border border-slate-200 bg-slate-50"></iframe>
       <p class="text-[11px] text-slate-400 mt-2">¿No se ve el documento arriba? Algunos navegadores de celular no muestran la vista previa dentro de la página — usa "Abrir en pestaña nueva".</p>
       ${actions}
     </div>`;
@@ -3633,15 +3916,16 @@ async function loadMaterialAttachmentInto(areaId, mt){
   try{
     const blob = await fetchAttachment(mt.fileRef);
     if(!blob) throw new Error('Adjunto no encontrado');
+    if(blob.size === 0) throw new Error('Adjunto vacío o dañado');
     if(CURRENT_PREVIEW_OBJECT_URL){ URL.revokeObjectURL(CURRENT_PREVIEW_OBJECT_URL); }
     CURRENT_PREVIEW_OBJECT_URL = URL.createObjectURL(blob);
     const area = document.getElementById(areaId);
     if(!area) return;
-    area.innerHTML = attachmentPreviewHTML(mt, CURRENT_PREVIEW_OBJECT_URL);
+    area.innerHTML = attachmentPreviewHTML(mt, CURRENT_PREVIEW_OBJECT_URL, attachmentPublicUrl(mt.fileRef));
   }catch(e){
     console.error(e);
     const area = document.getElementById(areaId);
-    if(area) area.innerHTML = `<p class="text-xs text-bad mt-5">No se pudo cargar el archivo adjunto.</p>`;
+    if(area) area.innerHTML = `<p class="text-xs text-bad mt-5">No se pudo cargar el archivo adjunto. Puede estar vacío, dañado, o haberse eliminado del almacenamiento.</p>`;
   }
 }
 
